@@ -1,0 +1,660 @@
+diff --git a/Code/Sandbox/EditorQt/AssetSystem/MaterialType.cpp b/Code/Sandbox/EditorQt/AssetSystem/MaterialType.cpp
+index 30956047..780a6024 100644
+--- a/Code/Sandbox/EditorQt/AssetSystem/MaterialType.cpp
++++ b/Code/Sandbox/EditorQt/AssetSystem/MaterialType.cpp
+@@ -46,6 +46,7 @@ void CMaterialType::GenerateThumbnail(const CAsset* pAsset) const
+ 		if (!m_pPreviewWidget)
+ 		{
+ 			m_pPreviewWidget.reset(new QPreviewWidget());
++			m_pPreviewWidget->EnableThumbnailPipeline(true);
+ 			m_pPreviewWidget->SetGrid(false);
+ 			m_pPreviewWidget->SetAxis(false);
+ 			m_pPreviewWidget->EnableMaterialPrecaching(true);
+diff --git a/Code/Sandbox/EditorQt/AssetSystem/MeshType.cpp b/Code/Sandbox/EditorQt/AssetSystem/MeshType.cpp
+index 1998328e..383179f2 100644
+--- a/Code/Sandbox/EditorQt/AssetSystem/MeshType.cpp
++++ b/Code/Sandbox/EditorQt/AssetSystem/MeshType.cpp
+@@ -102,7 +102,12 @@ void CMeshType::GenerateThumbnail(const CAsset* pAsset) const
+ 
+ 	const string thumbnailFileName = PathUtil::Make(PathUtil::GetGameProjectAssetsPath(), pAsset->GetThumbnailPath());
+ 
+-	static QPreviewWidget* pPreviewWidget = new QPreviewWidget();
++	static QPreviewWidget* pPreviewWidget = []()
++	{
++		QPreviewWidget* const pWidget = new QPreviewWidget();
++		pWidget->EnableThumbnailPipeline(true);
++		return pWidget;
++	}();
+ 	pPreviewWidget->SetGrid(false);
+ 	pPreviewWidget->SetAxis(false);
+ 	pPreviewWidget->EnableMaterialPrecaching(true);
+diff --git a/Code/Sandbox/EditorQt/AssetSystem/SkeletonType.cpp b/Code/Sandbox/EditorQt/AssetSystem/SkeletonType.cpp
+index e8a2dff3..7ba27425 100644
+--- a/Code/Sandbox/EditorQt/AssetSystem/SkeletonType.cpp
++++ b/Code/Sandbox/EditorQt/AssetSystem/SkeletonType.cpp
+@@ -61,7 +61,12 @@ void CSkeletonType::GenerateThumbnail(const CAsset* pAsset) const
+ 
+ 	const string thumbnailFileName = PathUtil::Make(PathUtil::GetGameProjectAssetsPath(), pAsset->GetThumbnailPath());
+ 
+-	static QPreviewWidget* pPreviewWidget = new QPreviewWidget();
++	static QPreviewWidget* pPreviewWidget = []()
++	{
++		QPreviewWidget* const pWidget = new QPreviewWidget();
++		pWidget->EnableThumbnailPipeline(true);
++		return pWidget;
++	}();
+ 	pPreviewWidget->SetGrid(false);
+ 	pPreviewWidget->SetAxis(false);
+ 	pPreviewWidget->EnableMaterialPrecaching(true);
+diff --git a/Code/Sandbox/EditorQt/AssetSystem/SkinnedMeshType.cpp b/Code/Sandbox/EditorQt/AssetSystem/SkinnedMeshType.cpp
+index de950483..1a73be5e 100644
+--- a/Code/Sandbox/EditorQt/AssetSystem/SkinnedMeshType.cpp
++++ b/Code/Sandbox/EditorQt/AssetSystem/SkinnedMeshType.cpp
+@@ -74,7 +74,12 @@ void CSkinnedMeshType::GenerateThumbnail(const CAsset* pAsset) const
+ 
+ 	const string thumbnailFileName = PathUtil::Make(PathUtil::GetGameProjectAssetsPath(), pAsset->GetThumbnailPath());
+ 
+-	static QPreviewWidget* pPreviewWidget = new QPreviewWidget();
++	static QPreviewWidget* pPreviewWidget = []()
++	{
++		QPreviewWidget* const pWidget = new QPreviewWidget();
++		pWidget->EnableThumbnailPipeline(true);
++		return pWidget;
++	}();
+ 	pPreviewWidget->SetGrid(false);
+ 	pPreviewWidget->SetAxis(false);
+ 	pPreviewWidget->EnableMaterialPrecaching(true);
+diff --git a/Code/Sandbox/EditorQt/QT/Widgets/QPreviewWidget.cpp b/Code/Sandbox/EditorQt/QT/Widgets/QPreviewWidget.cpp
+index 5983d770..8773cb2d 100644
+--- a/Code/Sandbox/EditorQt/QT/Widgets/QPreviewWidget.cpp
++++ b/Code/Sandbox/EditorQt/QT/Widgets/QPreviewWidget.cpp
+@@ -17,6 +17,8 @@
+ #include <CryAnimation/ICryAnimation.h>
+ #include <CryParticleSystem/IParticles.h>
+ #include <CryRenderer/IRenderAuxGeom.h>
++#include <CryRenderer/ITexture.h>
++#include <CrySystem/IStreamEngine.h>
+ 
+ #include <QtUtil.h>
+ #include <QDir.h>
+@@ -30,6 +32,65 @@
+ 
+ namespace Private_PreviewWidget
+ {
++constexpr float kThumbFovDegrees = 30.0f;
++constexpr float kThumbAzimuthDegrees = 60.0f;
++constexpr float kThumbFrameMargin = 1.08f;
++constexpr float kThumbFrameMarginMaterial = 0.81f;
++constexpr float kThumbVerticalDirection = -0.21f;
++constexpr float kThumbMinimumBoundingRadius = 0.05f;
++constexpr float kThumbMinimumCameraDistance = 0.1f;
++constexpr float kThumbMinimumNearPlane = 0.02f;
++constexpr float kThumbNearPlaneDistanceScale = 0.001f;
++constexpr float kThumbMinimumFarPlane = 4000.0f;
++constexpr float kThumbFarPlaneRadiusPadding = 3.0f;
++constexpr float kThumbMinimumDomeRadius = 500.0f;
++constexpr float kThumbDomeRadiusScale = 1.1f;
++constexpr float kThumbAmbientIntensity = 0.22f;
++constexpr float kThumbProbeIntensity = 3.5f;
++
++constexpr char kThumbDomeObject[] = "%EDITOR%/Objects/mtlsphere.cgf";
++constexpr char kThumbDomeMaterial[] = "%ENGINE%/EngineAssets/Materials/material_default";
++constexpr char kThumbDomeTexture[] = "%ENGINE%/EngineAssets/Textures/defaults/16_grey.dds";
++
++void AppendUniqueTexture(std::vector<ITexture*>& textures, ITexture* pTexture)
++{
++	if (pTexture && std::find(textures.begin(), textures.end(), pTexture) == textures.end())
++	{
++		textures.push_back(pTexture);
++	}
++}
++
++void CollectMaterialHierarchy(IMaterial* pMaterial, std::vector<IMaterial*>& materials)
++{
++	if (!pMaterial || std::find(materials.begin(), materials.end(), pMaterial) != materials.end())
++	{
++		return;
++	}
++	materials.push_back(pMaterial);
++
++	for (int subMaterialIndex = 0; subMaterialIndex < pMaterial->GetSubMtlCount(); ++subMaterialIndex)
++	{
++		CollectMaterialHierarchy(pMaterial->GetSubMtl(subMaterialIndex), materials);
++	}
++}
++
++void CollectMaterialTextures(const std::vector<IMaterial*>& materials, std::vector<ITexture*>& textures)
++{
++	for (IMaterial* const pMaterial : materials)
++	{
++		if (IRenderShaderResources* const pResources = pMaterial->GetShaderItem().m_pShaderResources)
++		{
++			for (int textureSlot = 0; textureSlot < EFTT_MAX; ++textureSlot)
++			{
++				if (SEfResTexture* const pTextureResource = pResources->GetTexture(textureSlot))
++				{
++					AppendUniqueTexture(textures, pTextureResource->m_Sampler.m_pITex);
++				}
++			}
++		}
++	}
++}
++
+ struct MaterialId
+ {
+ 	MaterialId(const void* pPtr, int id)
+@@ -198,6 +259,8 @@ IParticleEffect* FindValidParticleEffect(IParticleEffect* pParentEffect, const Q
+ }
+ }
+ 
++const char* const QPreviewWidget::kEnvProbeCubemap = "%ENGINE%/EngineAssets/Textures/default_probe_cm.dds";
++
+ QPreviewWidget::QPreviewWidget(const QString& modelFile, QWidget* pParent)
+ 	: QWidget(pParent)
+ 	, m_fov(60)
+@@ -225,6 +288,7 @@ QPreviewWidget::QPreviewWidget(const QString& modelFile, QWidget* pParent)
+ 	, m_bUseBacklight(false)
+ 	, m_bShowObject(true)
+ 	, m_bPrecacheMaterial(true)
++	, m_bThumbnailPipeline(false)
+ 	, m_bDrawWireFrame(false)
+ 	, m_bShowNormals(false)
+ 	, m_bShowPhysics(false)
+@@ -281,11 +345,56 @@ bool QPreviewWidget::CreateContext()
+ 
+ 		m_displayContextKey = m_pRenderer->CreateSwapChainBackedContext(desc);
+ 
+-		m_graphicsPipelineDesc.type = EGraphicsPipelineType::Minimum;
+-		m_graphicsPipelineDesc.shaderFlags = SHDF_SECONDARY_VIEWPORT | SHDF_ALLOWHDR | SHDF_FORWARD_MINIMAL;
++		if (m_bThumbnailPipeline)
++		{
++			m_graphicsPipelineDesc.type = EGraphicsPipelineType::CharacterTool;
++			m_graphicsPipelineDesc.shaderFlags = SHDF_SECONDARY_VIEWPORT | SHDF_ALLOWHDR
++				| SHDF_ALLOWPOSTPROCESS | SHDF_ALLOW_AO | SHDF_ZPASS | SHDF_ALLOW_SKY;
++		}
++		else
++		{
++			m_graphicsPipelineDesc.type = EGraphicsPipelineType::Minimum;
++			m_graphicsPipelineDesc.shaderFlags = SHDF_SECONDARY_VIEWPORT | SHDF_ALLOWHDR | SHDF_FORWARD_MINIMAL;
++		}
+ 
+ 		m_graphicsPipelineKey = m_pRenderer->CreateGraphicsPipeline(m_graphicsPipelineDesc);
+ 
++		if (m_bThumbnailPipeline)
++		{
++			m_pThumbnailDome = GetIEditorImpl()->Get3DEngine()->LoadStatObj(Private_PreviewWidget::kThumbDomeObject, nullptr, nullptr, false);
++			CMaterialManager* const pEditorMaterialManager = GetIEditorImpl()->GetMaterialManager();
++			CMaterial* const pSourceEditorMaterial = pEditorMaterialManager
++				? pEditorMaterialManager->LoadMaterial(Private_PreviewWidget::kThumbDomeMaterial, false)
++				: nullptr;
++			IMaterial* const pSourceMaterial = pSourceEditorMaterial ? pSourceEditorMaterial->GetMatInfo() : nullptr;
++			IMaterialManager* const pEngineMaterialManager = GetIEditorImpl()->Get3DEngine()->GetMaterialManager();
++			m_pThumbnailDomeMaterial = pSourceMaterial && pEngineMaterialManager
++				? pEngineMaterialManager->CloneMaterial(pSourceMaterial)
++				: nullptr;
++			m_pThumbnailDomeTexture = m_pRenderer->EF_LoadTexture(Private_PreviewWidget::kThumbDomeTexture, 0);
++
++			if (!m_pThumbnailDome || !m_pThumbnailDomeMaterial || !m_pThumbnailDomeTexture || !m_pThumbnailDomeTexture->IsTextureLoaded())
++			{
++				CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
++					"Thumbnail: grey studio dome unavailable (object=%d material=%d texture=%d loaded=%d); using the existing background.",
++					m_pThumbnailDome ? 1 : 0, m_pThumbnailDomeMaterial ? 1 : 0, m_pThumbnailDomeTexture ? 1 : 0,
++					m_pThumbnailDomeTexture && m_pThumbnailDomeTexture->IsTextureLoaded() ? 1 : 0);
++				m_pThumbnailDomeTexture = nullptr;
++				m_pThumbnailDomeMaterial = nullptr;
++				m_pThumbnailDome = nullptr;
++			}
++			else
++			{
++				m_pThumbnailDomeMaterial->SetTexture(m_pThumbnailDomeTexture->GetTextureID(), EFTT_DIFFUSE);
++				m_pThumbnailDomeMaterial->SetFlags(m_pThumbnailDomeMaterial->GetFlags() | MTL_FLAG_2SIDED);
++				m_pThumbnailDomeMaterial->PrecacheMaterial(0.0f, nullptr, true, true);
++				m_pThumbnailDomeMaterial->ForceTexturesLoading(max(m_width, m_height));
++				m_pThumbnailDomeMaterial->ForceTexturesLoading(0.0f);
++				m_thumbnailDomeRadius = Private_PreviewWidget::kThumbMinimumDomeRadius;
++				m_thumbnailDomeMatrix = Matrix34::CreateScale(Vec3(-m_thumbnailDomeRadius, m_thumbnailDomeRadius, m_thumbnailDomeRadius));
++			}
++		}
++
+ 		m_bContextCreated = true;
+ 
+ 		return true;
+@@ -789,7 +898,75 @@ void QPreviewWidget::SetCamera(const CCamera& camera)
+ 	const auto frustumWidth = width();
+ 	const auto frustumHeight = height();
+ 
+-	m_camera.SetFrustum(frustumWidth, frustumHeight, DEG2RAD(m_fov), m_camera.GetNearPlane(), m_camera.GetFarPlane());
++	const float fovDegrees = m_bThumbnailPipeline ? Private_PreviewWidget::kThumbFovDegrees : m_fov;
++	m_camera.SetFrustum(frustumWidth, frustumHeight, DEG2RAD(fovDegrees), m_camera.GetNearPlane(), m_camera.GetFarPlane());
++}
++
++void QPreviewWidget::ConfigureThumbnailCamera(bool logDetails)
++{
++	if (!m_bThumbnailPipeline || m_aabb.IsReset())
++	{
++		return;
++	}
++
++	const Vec3 target = m_aabb.GetCenter();
++	const Vec3 halfExtents = m_aabb.GetSize() * 0.5f;
++	const bool isMaterialPreview = m_pCurrentMaterial != nullptr;
++	const float previewSphereRadius = max(halfExtents.x, max(halfExtents.y, halfExtents.z));
++	const float boundingRadius = max(Private_PreviewWidget::kThumbMinimumBoundingRadius, isMaterialPreview ? previewSphereRadius : m_aabb.GetRadius());
++	const float fov = DEG2RAD(Private_PreviewWidget::kThumbFovDegrees);
++	const float cameraAzimuth = DEG2RAD(Private_PreviewWidget::kThumbAzimuthDegrees);
++	const Vec3 direction = Vec3(std::cos(cameraAzimuth), std::sin(cameraAzimuth), Private_PreviewWidget::kThumbVerticalDirection).GetNormalized();
++	const Matrix33 cameraOrientation = Matrix33::CreateRotationVDir(direction, 0.0f);
++	const Vec3 right = cameraOrientation.GetColumn0();
++	const Vec3 up = cameraOrientation.GetColumn2();
++	const float tanHalfFov = std::tan(fov * 0.5f);
++	float requiredDistance = 0.0f;
++	for (int x = 0; x < 2; ++x)
++	{
++		for (int y = 0; y < 2; ++y)
++		{
++			for (int z = 0; z < 2; ++z)
++			{
++				const Vec3 corner(
++					x == 0 ? m_aabb.min.x : m_aabb.max.x,
++					y == 0 ? m_aabb.min.y : m_aabb.max.y,
++					z == 0 ? m_aabb.min.z : m_aabb.max.z);
++				const Vec3 relativeCorner = corner - target;
++				const float depth = relativeCorner.Dot(direction);
++				const float horizontalHalfExtent = std::fabs(relativeCorner.Dot(right));
++				const float verticalHalfExtent = std::fabs(relativeCorner.Dot(up));
++				requiredDistance = max(requiredDistance,
++					max(horizontalHalfExtent, verticalHalfExtent) / tanHalfFov + depth);
++			}
++		}
++	}
++
++	const float frameMargin = isMaterialPreview ? Private_PreviewWidget::kThumbFrameMarginMaterial : Private_PreviewWidget::kThumbFrameMargin;
++	const float cameraDistance = max(Private_PreviewWidget::kThumbMinimumCameraDistance, requiredDistance * frameMargin);
++	const float nearPlane = max(Private_PreviewWidget::kThumbMinimumNearPlane, cameraDistance * Private_PreviewWidget::kThumbNearPlaneDistanceScale);
++	Matrix34 cameraMatrix = cameraOrientation;
++	cameraMatrix.SetTranslation(target - direction * cameraDistance);
++	const float cameraOriginDistance = cameraMatrix.GetTranslation().GetLength();
++	m_thumbnailDomeRadius = max(Private_PreviewWidget::kThumbMinimumDomeRadius,
++		(cameraOriginDistance + boundingRadius) * Private_PreviewWidget::kThumbDomeRadiusScale);
++	m_thumbnailDomeMatrix = Matrix34::CreateScale(Vec3(-m_thumbnailDomeRadius, m_thumbnailDomeRadius, m_thumbnailDomeRadius));
++	const float farPlane = max(
++		max(Private_PreviewWidget::kThumbMinimumFarPlane, cameraDistance + boundingRadius * Private_PreviewWidget::kThumbFarPlaneRadiusPadding),
++		cameraOriginDistance + m_thumbnailDomeRadius + boundingRadius);
++
++	m_cameraTarget = target;
++	m_cameraRadius = cameraDistance;
++	m_camera.SetMatrix(cameraMatrix);
++	m_camera.SetFrustum(max(1, m_width), max(1, m_height), fov, nearPlane, farPlane);
++
++	if (logDetails)
++	{
++		CryLogAlways("Thumbnail: camera fit required=%.3f radius=%.3f distance=%.3f fov=%.1f margin=%.3f azimuth=%.1f vertical=%.2f near=%.3f far=%.3f domeRadius=%.3f cameraOriginDistance=%.3f material=%d",
++			requiredDistance, boundingRadius, cameraDistance, Private_PreviewWidget::kThumbFovDegrees, frameMargin,
++			Private_PreviewWidget::kThumbAzimuthDegrees, Private_PreviewWidget::kThumbVerticalDirection, nearPlane, farPlane,
++			m_thumbnailDomeRadius, cameraOriginDistance, isMaterialPreview ? 1 : 0);
++	}
+ }
+ 
+ bool QPreviewWidget::Render()
+@@ -818,7 +995,10 @@ bool QPreviewWidget::Render()
+ 
+ 		m_pRenderer->BeginFrame(m_displayContextKey, m_graphicsPipelineKey);
+ 
+-		DrawBackground();
++		if (!m_bThumbnailPipeline || !m_pThumbnailDome || !m_pThumbnailDomeMaterial)
++		{
++			DrawBackground();
++		}
+ 		if (m_bGrid || m_bAxis)
+ 		{
+ 			DrawGrid();
+@@ -837,6 +1017,66 @@ bool QPreviewWidget::Render()
+ 		SRenderingPassInfo passInfo = SRenderingPassInfo::CreateGeneralPassRenderingInfo(m_graphicsPipelineKey, m_camera, SRenderingPassInfo::DEFAULT_FLAGS, true, m_displayContextKey);
+ 		m_pRenderer->EF_StartEf(passInfo);
+ 
++		if (m_bThumbnailPipeline)
++		{
++			m_envProbe.SetPosition(Vec3(0, 0, 0));
++			m_envProbe.SetRadius(10000.0f, 0);
++			m_envProbe.SetLightColor(ColorF(1, 1, 1, 1));
++			m_envProbe.m_ProbeExtents = Vec3(m_envProbe.m_fRadius);
++			m_envProbe.m_fBoxWidth = m_envProbe.m_fRadius * 0.5f;
++			m_envProbe.m_fBoxLength = m_envProbe.m_fRadius * 0.5f;
++			m_envProbe.m_fBoxHeight = m_envProbe.m_fRadius * 0.5f;
++			m_envProbe.m_Flags |= DLF_DEFERRED_CUBEMAPS;
++			m_envProbe.SetMatrix(Matrix34::CreateIdentity());
++
++			if (!m_envProbeInitialized)
++			{
++				m_envProbeInitialized = true;
++				m_envProbe.m_Flags &= ~DLF_DISABLED;
++
++				const char* specularCubemap = kEnvProbeCubemap;
++				string specularName(specularCubemap);
++				const int diffuseSuffixIndex = specularName.find("_diff");
++				if (diffuseSuffixIndex >= 0)
++				{
++					specularName = specularName.substr(0, diffuseSuffixIndex) + specularName.substr(diffuseSuffixIndex + 5, specularName.length());
++					specularCubemap = specularName.c_str();
++				}
++
++				CryPathString diffuseCubemap;
++				diffuseCubemap.Format("%s%s%s.%s", PathUtil::AddSlash(PathUtil::GetPathWithoutFilename(specularCubemap)).c_str(),
++					PathUtil::GetFileName(specularCubemap).c_str(), "_diff", PathUtil::GetExt(specularCubemap));
++
++				const string specularCubemapUnix = PathUtil::ToUnixPath(specularCubemap);
++				const string diffuseCubemapUnix = PathUtil::ToUnixPath(diffuseCubemap);
++
++				m_envProbe.SetSpecularCubemap(m_pRenderer->EF_LoadTexture(specularCubemapUnix.c_str(), 0));
++				m_envProbe.SetDiffuseCubemap(m_pRenderer->EF_LoadTexture(diffuseCubemapUnix.c_str(), 0));
++
++				bool cubemapLoadFailed = false;
++				if (!m_envProbe.GetSpecularCubemap() || !m_envProbe.GetSpecularCubemap()->IsTextureLoaded())
++				{
++					GetISystem()->Warning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_WARNING, 0, specularCubemap,
++						"Deferred cubemap texture not found: %s", specularCubemap);
++					cubemapLoadFailed = true;
++				}
++				if (!m_envProbe.GetDiffuseCubemap() || !m_envProbe.GetDiffuseCubemap()->IsTextureLoaded())
++				{
++					GetISystem()->Warning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_WARNING, 0, diffuseCubemap,
++						"Deferred diffuse cubemap texture not found: %s", diffuseCubemap.c_str());
++					cubemapLoadFailed = true;
++				}
++
++				if (cubemapLoadFailed)
++				{
++					m_envProbe.m_Flags |= DLF_DISABLED;
++					m_envProbe.ReleaseCubemaps();
++				}
++			}
++
++			m_pRenderer->EF_AddDeferredLight(m_envProbe, Private_PreviewWidget::kThumbProbeIntensity, passInfo);
++		}
++
+ 		// Add lights.
+ 		for (std::size_t i = 0; i < m_lights.size(); ++i)
+ 		{
+@@ -917,6 +1157,18 @@ bool QPreviewWidget::Render()
+ 			}
+ 		}
+ 
++		if (m_bThumbnailPipeline && m_pThumbnailDome && m_pThumbnailDomeMaterial)
++		{
++			SRendParams domeRenderParams;
++			domeRenderParams.AmbientColor = ColorF(Private_PreviewWidget::kThumbAmbientIntensity,
++				Private_PreviewWidget::kThumbAmbientIntensity, Private_PreviewWidget::kThumbAmbientIntensity, 1.0f);
++			domeRenderParams.dwFObjFlags = FOB_TRANS_MASK | FOB_NO_FOG;
++			domeRenderParams.pMatrix = &m_thumbnailDomeMatrix;
++			domeRenderParams.pPrevMatrix = &m_thumbnailDomeMatrix;
++			domeRenderParams.pMaterial = m_pThumbnailDomeMaterial;
++			m_pThumbnailDome->Render(domeRenderParams, passInfo);
++		}
++
+ 		if (m_bShowObject && !bNoPreview)
+ 		{
+ 			RenderObject(pMaterial, passInfo);
+@@ -942,8 +1194,15 @@ void QPreviewWidget::RenderObject(IMaterial* pMaterial, const SRenderingPassInfo
+ 
+ 	SRendParams renderParams;
+ 
+-	auto scaledColor = m_ambientColor * m_ambientMultiplier;
+-	renderParams.AmbientColor = ColorF(scaledColor.redF(), scaledColor.greenF(), scaledColor.blueF(), scaledColor.alphaF());
++	if (m_bThumbnailPipeline)
++	{
++		renderParams.AmbientColor = ColorF(kThumbAmbientIntensity, kThumbAmbientIntensity, kThumbAmbientIntensity, 1.0f);
++	}
++	else
++	{
++		auto scaledColor = m_ambientColor * m_ambientMultiplier;
++		renderParams.AmbientColor = ColorF(scaledColor.redF(), scaledColor.greenF(), scaledColor.blueF(), scaledColor.alphaF());
++	}
+ 	renderParams.dwFObjFlags = FOB_TRANS_MASK /*| FOB_GLOBAL_ILLUMINATION*/ | FOB_NO_FOG /*| FOB_ZPREPASS*/;
+ 	renderParams.pMaterial = pMaterial;
+ 
+@@ -1082,6 +1341,15 @@ void QPreviewWidget::EnableWireframeRendering(const bool bDrawWireframe)
+ 	m_bDrawWireFrame = bDrawWireframe;
+ }
+ 
++void QPreviewWidget::EnableThumbnailPipeline(const bool bEnable)
++{
++	CRY_ASSERT_MESSAGE(!m_bContextCreated, "The thumbnail graphics pipeline must be selected before the preview context is created.");
++	if (!m_bContextCreated)
++	{
++		m_bThumbnailPipeline = bEnable;
++	}
++}
++
+ void QPreviewWidget::SetCameraTM(const Matrix34& cameraTM)
+ {
+ 	m_camera.SetMatrix(cameraTM);
+@@ -1095,6 +1363,13 @@ const Matrix34& QPreviewWidget::GetCameraTM() const
+ void QPreviewWidget::DeleteRenderContex()
+ {
+ 	ReleaseObject();
++	m_envProbe.ReleaseCubemaps();
++	m_envProbeInitialized = false;
++	m_pThumbnailDomeTexture = nullptr;
++	m_pThumbnailDomeMaterial = nullptr;
++	m_pThumbnailDome = nullptr;
++	m_thumbnailDomeMatrix.SetIdentity();
++	m_thumbnailDomeRadius = 0.0f;
+ 
+ 	// Destroy render context.
+ 	if (m_pRenderer && m_bContextCreated)
+@@ -1226,6 +1501,8 @@ void QPreviewWidget::OnEditorNotifyEvent(EEditorNotifyEvent event)
+ 
+ void QPreviewWidget::SavePreview(const char* outFile)
+ {
++	using namespace Private_PreviewWidget;
++
+ 	if (m_pCurrentMaterial)
+ 	{
+ 		m_pCurrentMaterial->LoadShader();
+@@ -1243,12 +1520,145 @@ void QPreviewWidget::SavePreview(const char* outFile)
+ 	// Flush pending commands to make sure SShaderItem::m_nPreprocessFlags is updated
+ 	m_pRenderer->FlushRTCommands(true, true, true);
+ 
++	_smart_ptr<IMaterial> pCurrentMaterial;
++	if (m_pCurrentMaterial)
++	{
++		pCurrentMaterial = m_pCurrentMaterial->GetMatInfo();
++	}
++	if (!pCurrentMaterial)
++	{
++		if (m_pObject)
++		{
++			pCurrentMaterial = m_pObject->GetMaterial();
++		}
++		else if (m_pEntity)
++		{
++			pCurrentMaterial = m_pEntity->GetMaterial();
++		}
++		else if (m_pCharacter)
++		{
++			pCurrentMaterial = m_pCharacter->GetIMaterial();
++		}
++		else if (m_pEmitter)
++		{
++			pCurrentMaterial = m_pEmitter->GetMaterial();
++		}
++	}
++
++	std::vector<IMaterial*> materials;
++	CollectMaterialHierarchy(pCurrentMaterial, materials);
++	std::vector<ITexture*> textures;
++	CollectMaterialTextures(materials, textures);
++
++	const int screenTexels = max(width(), height());
++	for (IMaterial* const pMaterial : materials)
++	{
++		pMaterial->PrecacheMaterial(0.0f, nullptr, true, true);
++		pMaterial->ForceTexturesLoading(screenTexels);
++		pMaterial->ForceTexturesLoading(0.0f);
++	}
++	m_pRenderer->FlushRTCommands(true, true, true);
++
++	int texturePrecacheUpdateId = 0;
++	const CTimeValue streamingStart = gEnv->pTimer->GetAsyncTime();
++	constexpr float demandPropagationSeconds = 0.05f;
++	// Broken source/RC paths can leave local textures pending while the streamer has
++	// no work. Bound that state so startup thumbnail repair cannot hot-loop Render().
++	constexpr int maxNoProgressPollFrames = 256;
++	int quietFrames = 0;
++	int pollFrames = 0;
++	int noProgressPollFrames = 0;
++	size_t lastStreamingRequestCount = 0;
++	size_t lastPendingFullMipTextureCount = 0;
++	size_t previousPendingFullMipTextureCount = textures.size();
++	bool poolOverflowObserved = false;
++	bool streamingStalled = false;
++	bool streamingTimedOut = false;
++	while (quietFrames < 2)
++	{
++		++texturePrecacheUpdateId;
++		for (ITexture* const pTexture : textures)
++		{
++			m_pRenderer->EF_PrecacheResource(pTexture, 0.0f, 0.0f,
++				FPR_STARTLOADING | FPR_HIGHPRIORITY, texturePrecacheUpdateId);
++		}
++
++		Render();
++		++pollFrames;
++		m_pRenderer->FlushRTCommands(true, true, true);
++		if (gEnv->pSystem && gEnv->pSystem->GetStreamEngine())
++		{
++			gEnv->pSystem->GetStreamEngine()->Update();
++		}
++
++		STextureStreamingStats streamingStats(false);
++		m_pRenderer->EF_Query(EFQ_GetTexStreamingInfo, streamingStats);
++		lastStreamingRequestCount = streamingStats.nNumStreamingRequests;
++		poolOverflowObserved = poolOverflowObserved || streamingStats.bPoolOverflow;
++
++		lastPendingFullMipTextureCount = 0;
++		for (ITexture* const pTexture : textures)
++		{
++			if (pTexture->IsStreamable() && (!pTexture->IsTextureLoaded() || pTexture->GetMinLoadedMip() > 0))
++			{
++				++lastPendingFullMipTextureCount;
++			}
++		}
++
++		const float elapsedSeconds = (gEnv->pTimer->GetAsyncTime() - streamingStart).GetSeconds();
++		quietFrames = (elapsedSeconds >= demandPropagationSeconds && lastStreamingRequestCount == 0 && lastPendingFullMipTextureCount == 0) ? quietFrames + 1 : 0;
++		if (elapsedSeconds >= demandPropagationSeconds && lastStreamingRequestCount == 0 && lastPendingFullMipTextureCount > 0)
++		{
++			noProgressPollFrames = lastPendingFullMipTextureCount == previousPendingFullMipTextureCount ? noProgressPollFrames + 1 : 0;
++		}
++		else
++		{
++			noProgressPollFrames = 0;
++		}
++		previousPendingFullMipTextureCount = lastPendingFullMipTextureCount;
++		ConfigureThumbnailCamera();
++
++		if (noProgressPollFrames >= maxNoProgressPollFrames)
++		{
++			CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
++				"Thumbnail: texture streaming made no mip progress for %d polls, capturing anyway ('%s')",
++				maxNoProgressPollFrames, outFile);
++			streamingStalled = true;
++			break;
++		}
++		if (elapsedSeconds > 10.0f)
++		{
++			CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
++				"Thumbnail: texture streaming did not settle in 10s, capturing anyway ('%s')", outFile);
++			streamingTimedOut = true;
++			break;
++		}
++	}
++	ConfigureThumbnailCamera(true);
++
++	const float streamingSeconds = (gEnv->pTimer->GetAsyncTime() - streamingStart).GetSeconds();
++	CryLogAlways("Thumbnail: texture streaming gate frames=%d seconds=%.3f textures=%u requests=%u pendingMip0=%u poolOverflow=%d stalled=%d timedOut=%d ('%s')",
++		pollFrames, streamingSeconds, static_cast<unsigned int>(textures.size()), static_cast<unsigned int>(lastStreamingRequestCount),
++		static_cast<unsigned int>(lastPendingFullMipTextureCount), poolOverflowObserved ? 1 : 0, streamingStalled ? 1 : 0,
++		streamingTimedOut ? 1 : 0, outFile);
++	for (ITexture* const pTexture : textures)
++	{
++		if (pTexture->IsStreamable())
++		{
++			CryLogAlways("Thumbnail: texture '%s' loaded=%d minLoadedMip=%d",
++				pTexture->GetName(), pTexture->IsTextureLoaded() ? 1 : 0, static_cast<int>(pTexture->GetMinLoadedMip()));
++		}
++	}
++
++	// Render the same asset twice to push the threaded renderer's presented buffer
++	// past the previous asset before taking the screenshot.
++	Render();
+ 	Render();
++	m_pRenderer->FlushRTCommands(true, true, true);
+ 
+ 	QDir().mkpath(QtUtil::ToQString(PathUtil::GetPathWithoutFilename(outFile)));
+ 	m_pRenderer->ScreenShot(outFile, m_displayContextKey);
+ }
+-
+ QImage QPreviewWidget::GetImage()
+ {
+ 	const auto clientWidth = width();
+diff --git a/Code/Sandbox/EditorQt/QT/Widgets/QPreviewWidget.h b/Code/Sandbox/EditorQt/QT/Widgets/QPreviewWidget.h
+index d5dcb148..8c3ae561 100644
+--- a/Code/Sandbox/EditorQt/QT/Widgets/QPreviewWidget.h
++++ b/Code/Sandbox/EditorQt/QT/Widgets/QPreviewWidget.h
+@@ -8,8 +8,10 @@
+ #include <CryMath/Cry_Camera.h>
+ 
+ struct ICharacterInstance;
++struct IMaterial;
+ struct IParticleEffect;
+ struct IStatObj;
++struct ITexture;
+ struct SRenderingPassInfo;
+ class CMaterial;
+ 
+@@ -81,6 +83,7 @@ public:
+ 
+ 	void                EnableMaterialPrecaching(const bool bPrecacheMaterial);
+ 	void                EnableWireframeRendering(const bool bDrawWireframe);
++	void                EnableThumbnailPipeline(const bool bEnable);
+ 
+ 	bool                CreateContext();
+ 	void                ReleaseObject();
+@@ -122,11 +125,14 @@ private:
+ 
+ 	bool Render();
+ 	void SetCamera(const CCamera& camera);
++	void ConfigureThumbnailCamera(bool logDetails = false);
+ 
+ 	void DrawGrid();
+ 	void DrawBackground();
+ 
+ private:
++	static const char* const kEnvProbeCubemap;
++
+ 	enum class Mode
+ 	{
+ 		None,
+@@ -149,6 +155,13 @@ protected:
+ 	Vec3                                    m_size;
+ 	QString                                 m_loadedFile;
+ 	std::vector<SRenderLight>               m_lights;
++	SRenderLight                            m_envProbe;
++	bool                                    m_envProbeInitialized = false;
++	_smart_ptr<IStatObj>                    m_pThumbnailDome;
++	_smart_ptr<IMaterial>                   m_pThumbnailDomeMaterial;
++	_smart_ptr<ITexture>                    m_pThumbnailDomeTexture;
++	Matrix34                                m_thumbnailDomeMatrix;
++	float                                   m_thumbnailDomeRadius = 0.0f;
+ 	AABB                                    m_aabb;
+ 	Vec3                                    m_cameraTarget;
+ 	float                                   m_cameraRadius;
+@@ -169,6 +182,7 @@ protected:
+ 	bool                                    m_bUseBacklight;
+ 	bool                                    m_bShowObject;
+ 	bool                                    m_bPrecacheMaterial;
++	bool                                    m_bThumbnailPipeline;
+ 	bool                                    m_bDrawWireFrame;
+ 	bool                                    m_bShowNormals;
+ 	bool                                    m_bShowPhysics;
